@@ -1,7 +1,7 @@
 import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
-import timm, wandb, hydra, tqdm
+import timm, mlflow, hydra, tqdm
 from omegaconf import DictConfig
 from datasets import load_dataset
 from torch.amp import GradScaler, autocast
@@ -37,18 +37,35 @@ class ViTEncoder(nn.Module):
             pretrained=False,
             num_classes=512,
             drop_path_rate=0.1,
-            img_size=128,
+            img_size=64,
+            in_channels=16, # 16 variables, 12 time steps, all surface variables
         )
+        # Final prediction needs to be matching the solar prediction data, so 12 * 2 (30min resolution) or 12 * 12 (5min resolution)
+        # 30 min data is more reliable, and matches more the accumulated generation
+        # ReLU output as cant be negative generation values, and batchnorm to stabilize training
         self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d)
 
-    def forward(self, x):
+    def forward(self, x, metadata):
+        # TODO Should take the NWP input, and then metadata about the system to be predicted, then output the embeddings and the projections for the SIGReg loss
+        # TODO First pass is just NWP input, and then we can add the metadata in a second pass if we have time
+        # TODO other metadata includes time of day (although sorta in the NWP data),
+        # TODO Could do a per-timestep embedding, then merge the timestep embeddings to predict generation
+        # metadata is just the ID of the system, as that includes all the other metadata about the system, location, size, etc, and then can do a lookup embedding for that and add it to the NWP embedding, or concatenate it and pass through an MLP
+        # TODO Problem can be done as categorical, by binning the generation values, and then doing a classification loss on top of the probe, which might be easier to train and more stable, and also matches more the real world use case of predicting generation ranges rather than exact values
+        # Similar to MetNet, and train one timestep at a time, still ideally would have metadata about the site, but can start without it
+        # Each example is a different forecast time and generation for that time. Can try both easily, single timestep or combined timesteps
+        # Also can do it with a 3 timstep one, the one before, at, and after and predict the 3-5 timesteps around that point
         N, V = x.shape[:2]
         emb = self.backbone(x.flatten(0, 1))
+        # TODO Add the metadata embedding here to emb
+
+        # The projection is to a 2D image, single channel, so would want a 2D series output from projection for the regression, or categorical classification
         return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
 
 
 class HFDataset(torch.utils.data.Dataset):
     def __init__(self, split, V=1):
+        # TODO: Load the Zipped Zarr for a time period, and the solar prediction data from 30min data
         self.V = V
         self.ds = load_dataset("frgfm/imagenette", "160px", split=split)
         self.aug = v2.Compose(
@@ -86,7 +103,7 @@ class HFDataset(torch.utils.data.Dataset):
 
 @hydra.main(version_base=None)
 def main(cfg: DictConfig):
-    wandb.init(project="LeJEPA", config=dict(cfg))
+    mlflow.start_run(run_id="LeJEPA")
     torch.manual_seed(0)
 
     train_ds = HFDataset("train", V=cfg.V)
@@ -131,7 +148,7 @@ def main(cfg: DictConfig):
             scaler.step(opt)
             scaler.update()
             scheduler.step()
-            wandb.log(
+            mlflow.log_metrics(
                 {
                     "train/probe": probe_loss.item(),
                     "train/lejepa": lejepa_loss.item(),
@@ -149,8 +166,7 @@ def main(cfg: DictConfig):
                 y = y.to("cuda", non_blocking=True)
                 with autocast("cuda", dtype=torch.bfloat16):
                     correct += (probe(net(vs)[0]).argmax(1) == y).sum().item()
-        wandb.log({"test/acc": correct / len(test_ds), "test/epoch": epoch})
-    wandb.finish()
+        mlflow.log_metrics({"test/acc": correct / len(test_ds), "test/epoch": epoch})
 
 
 if __name__ == "__main__":
