@@ -58,13 +58,12 @@ class ViTEncoder(nn.Module):
             in_chans=11*3,
             # 16 variables, 12 time steps, all surface variables, add spatial embeddings of the lat/lon or OSB number, so would add another 4-16 channels
         )
-        self.metadata_proj = MLP(7, [64, 128, 256, 512], norm_layer=nn.BatchNorm1d)
         # Final prediction needs to be matching the solar prediction data, so 12 * 2 (30min resolution) or 12 * 12 (5min resolution)
         # 30 min data is more reliable, and matches more the accumulated generation
         # ReLU output as cant be negative generation values, and batchnorm to stabilize training
         self.proj = MLP(512, [2048, 2048, proj_dim], norm_layer=nn.BatchNorm1d)
 
-    def forward(self, x, metadata):
+    def forward(self, x):
         # TODO Should take the NWP input, and then metadata about the system to be predicted, then output the embeddings and the projections for the SIGReg loss
         # TODO First pass is just NWP input, and then we can add the metadata in a second pass if we have time
         # TODO other metadata includes time of day (although sorta in the NWP data),
@@ -78,16 +77,14 @@ class ViTEncoder(nn.Module):
         # TODO First pass will be 3 timesteps, and 1 output step, aligned in time with the center one
         N, V = x.shape[:2]
         emb = self.backbone(x)
-        metadata_emb = self.metadata_proj(metadata)
-        # Combine the two here additively
-        emb = emb + metadata_emb
+        # TODO Add the metadata embedding here to emb
 
         # The projection is to a 2D image, single channel, so would want a 2D series output from projection for the regression, or categorical classification
         return emb, self.proj(emb).reshape(N, V, -1).transpose(0, 1)
 
 
 def main():
-    mlflow.start_run(run_name="3_hour_prediction_with_metadata")
+    mlflow.start_run(run_name="single_prediction")
     batch_size = 256
 
     train_ds = SolarDataset("train")
@@ -99,7 +96,7 @@ def main():
 
     # modules and loss
     net = ViTEncoder(proj_dim=5280).to("cuda")
-    probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 5)).to(
+    probe = nn.Sequential(nn.LayerNorm(512), nn.Linear(512, 1)).to(
         "cuda")  # TODO Change out features to categorical bins for prediction, from 0 to 1 generation, or single output features/multiple features one for each forecast timestep
     sigreg = SIGReg().to("cuda")
     # Optimizer and scheduler
@@ -121,11 +118,10 @@ def main():
             if i > len(train):
                 break
             with autocast("cuda", dtype=torch.bfloat16):
-                metadata = vs["metadata"]
                 vs = vs["metoffice"] # Ignore metadata for now
                 vs = vs.to("cuda", non_blocking=True)
                 y = y.to("cuda", non_blocking=True)
-                emb, proj = net(vs, metadata)
+                emb, proj = net(vs)
                 inv_loss = (proj.mean(
                     0) - proj).square().mean()  # RMSE of the mean of the projection vs the projection -> for solar, this would need to be a series of points
                 sigreg_loss = sigreg(proj)
@@ -160,19 +156,18 @@ def main():
             for i, (vs, y) in enumerate(tqdm.tqdm(test, total=len(test), desc="Test")):
                 if i > len(test):
                     break
-                metadata = vs["metadata"]
                 vs = vs["metoffice"] # Ignore metadata for now
                 vs = vs.to("cuda", non_blocking=True)
                 y = y.to("cuda", non_blocking=True)
                 with autocast("cuda", dtype=torch.bfloat16):
-                    error = (probe(net(vs, metadata)[0]) - y).square().mean().item()
+                    error = (probe(net(vs)[0]) - y).square().mean().item()
                     errors.append(error)
         mlflow.log_metrics({"test/mse": np.mean(errors), "test/epoch": epoch}, step=global_step)
         # Save to disk
         model_state_dict = net.state_dict()
         probe_state_dict = probe.state_dict()
-        torch.save(model_state_dict, f"metadata_model_state_dict_{epoch=}.pth")
-        torch.save(probe_state_dict, f"metadata_probe_state_dict_{epoch=}.pth")
+        torch.save(model_state_dict, f"single_model_state_dict_{epoch=}.pth")
+        torch.save(probe_state_dict, f"single_probe_state_dict_{epoch=}.pth")
 
 
 class SolarDataset(torch.utils.data.IterableDataset):
@@ -282,6 +277,7 @@ class SolarDataset(torch.utils.data.IterableDataset):
                 # If over 1.5 for any of them, then skip as well
                 if np.sum(pv_system_generation) > 5: # Over 5 is more than 1 per one generally
                     continue
+                pv_system_generation = np.asarray([pv_system_generation[2]]) # For the middle one
                 system_metadata["tilt"] = system_metadata["tilt"].fillna(0.0) / 90.0
                 system_metadata["orientation"] = system_metadata["orientation"].fillna(0.0)
                 # Need sin and cos of orientation since its circular
